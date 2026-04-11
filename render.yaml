@@ -1,0 +1,28 @@
+services:
+  - type: web
+    name: line-calendar-bot
+    env: python
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn main:app --workers 1 --bind 0.0.0.0:$PORT --timeout 120
+    envVars:
+      - key: LINE_CHANNEL_SECRET
+        sync: false
+      - key: LINE_CHANNEL_ACCESS_TOKEN
+        sync: false
+      - key: LINE_USER_ID
+        sync: false
+      - key: CHATWORK_API_TOKEN
+        sync: false
+      - key: CHATWORK_ROOM_IDS
+        value: ""
+      - key: CHATWORK_POLL_INTERVAL
+        value: "5"
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: OPENAI_MODEL
+        value: gpt-4o-mini
+      - key: GOOGLE_CREDENTIALS_JSON
+        sync: false
+      - key: GOOGLE_TOKEN_JSON
+        sync: false
