@@ -19,12 +19,15 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
-LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
-LINE_USER_ID = os.environ.get('LINE_USER_ID', '')
+LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '').strip()
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').strip()
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
+
+GEMINI_API_KEY = os.environ.get('OPENAI_API_KEY', '').strip()
+GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
 
 
-def verify_signature(body: bytes, signature: str) -> bool:
+def verify_signature(body: bytes, signature: str ) -> bool:
     """LINE Webhook署名検証"""
     hash_val = hmac.new(
         LINE_CHANNEL_SECRET.encode('utf-8'),
@@ -40,7 +43,7 @@ def send_line_message(user_id: str, text: str):
     url = 'https://api.line.me/v2/bot/message/push'
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
+        'Authorization': 'Bearer ' + LINE_CHANNEL_ACCESS_TOKEN
     }
     payload = {
         'to': user_id,
@@ -48,10 +51,10 @@ def send_line_message(user_id: str, text: str):
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=10 )
-        logger.info(f'LINE push response: {resp.status_code}')
+        logger.info('LINE push response: ' + str(resp.status_code))
         return resp.status_code == 200
     except Exception as e:
-        logger.error(f'LINE push error: {e}')
+        logger.error('LINE push error: ' + str(e))
         return False
 
 
@@ -60,7 +63,7 @@ def reply_line_message(reply_token: str, text: str):
     url = 'https://api.line.me/v2/bot/message/reply'
     headers = {
         'Content-Type': 'application/json',
-        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
+        'Authorization': 'Bearer ' + LINE_CHANNEL_ACCESS_TOKEN
     }
     payload = {
         'replyToken': reply_token,
@@ -68,40 +71,38 @@ def reply_line_message(reply_token: str, text: str):
     }
     try:
         resp = requests.post(url, headers=headers, json=payload, timeout=10 )
-        logger.info(f'LINE reply response: {resp.status_code}')
+        logger.info('LINE reply response: ' + str(resp.status_code))
+        if resp.status_code != 200:
+            logger.error('LINE reply error body: ' + resp.text)
     except Exception as e:
-        logger.error(f'LINE reply error: {e}')
+        logger.error('LINE reply error: ' + str(e))
 
 
 def analyze_message_with_ai(text: str) -> str:
-    """AIでメッセージを分析して予定・締切を検出する"""
+    """Gemini APIでメッセージを分析して予定・締切を検出する"""
     try:
-        from openai import OpenAI
-        api_key = os.environ.get('OPENAI_API_KEY', '')
-
-        client = OpenAI(
-            api_key=api_key,
-            base_url='https://generativelanguage.googleapis.com/v1beta/openai/'
-         )
-
-        response = client.chat.completions.create(
-            model='gemini-2.0-flash',
-            messages=[
+        url = GEMINI_API_URL + '?key=' + GEMINI_API_KEY
+        payload = {
+            'contents': [
                 {
-                    'role': 'system',
-                    'content': 'あなたはフリーランスのアシスタントです。メッセージから予定、締切、タスクを検出して日本語で簡潔に報告してください。予定や締切がない場合は「特に予定・締切はありません」と答えてください。'
-                },
-                {
-                    'role': 'user',
-                    'content': f'以下のメッセージから予定・締切・タスクを検出してください:\n\n{text}'
+                    'parts': [
+                        {
+                            'text': 'あなたはフリーランスのアシスタントです。以下のメッセージから予定、締切、タスクを検出して日本語で簡潔に報告してください。予定や締切がない場合は「特に予定・締切はありません」と答えてください。\n\n' + text
+                        }
+                    ]
                 }
-            ],
-            max_tokens=500
-        )
-        return response.choices[0].message.content
+            ]
+        }
+        resp = requests.post(url, json=payload, timeout=15)
+        if resp.status_code == 200:
+            data = resp.json()
+            return data['candidates'][0]['content']['parts'][0]['text']
+        else:
+            logger.error('Gemini API error: ' + str(resp.status_code) + ' ' + resp.text)
+            return 'AI分析エラー: ' + str(resp.status_code)
     except Exception as e:
-        logger.error(f'AI analysis error: {e}')
-        return f'AI分析エラー: {str(e)}'
+        logger.error('AI analysis error: ' + str(e))
+        return 'AI分析エラー: ' + str(e)
 
 
 @app.route('/webhook', methods=['POST'])
@@ -117,7 +118,7 @@ def webhook():
     try:
         events = json.loads(body.decode('utf-8')).get('events', [])
     except Exception as e:
-        logger.error(f'JSON parse error: {e}')
+        logger.error('JSON parse error: ' + str(e))
         abort(400)
 
     for event in events:
@@ -126,13 +127,10 @@ def webhook():
             user_id = event.get('source', {}).get('userId', '')
             text = event['message']['text']
 
-            logger.info(f'Received message from {user_id}: {text}')
-
-            if user_id and not LINE_USER_ID:
-                logger.info(f'LINE User ID detected: {user_id}')
+            logger.info('Received message from ' + user_id + ': ' + text)
 
             analysis = analyze_message_with_ai(text)
-            reply_text = f'📋 メッセージ分析結果:\n{analysis}'
+            reply_text = '📋 メッセージ分析結果:\n' + analysis
 
             reply_line_message(reply_token, reply_text)
 
@@ -145,9 +143,9 @@ def auth_google():
     try:
         from google_calendar import get_auth_url
         auth_url = get_auth_url()
-        return f'<a href="{auth_url}">Googleカレンダーと連携する</a>'
+        return '<a href="' + auth_url + '">Googleカレンダーと連携する</a>'
     except Exception as e:
-        return f'エラー: {e}', 500
+        return 'エラー: ' + str(e), 500
 
 
 @app.route('/auth/google/callback')
@@ -157,9 +155,9 @@ def auth_google_callback():
         from google_calendar import handle_callback
         code = request.args.get('code', '')
         handle_callback(code)
-        return 'Googleカレンダーの連携が完了しました！LINEに通知します。'
+        return 'Googleカレンダーの連携が完了しました！'
     except Exception as e:
-        return f'エラー: {e}', 500
+        return 'エラー: ' + str(e), 500
 
 
 @app.route('/test/morning')
@@ -170,15 +168,12 @@ def test_morning():
         send_morning_summary()
         return '朝の通知を送信しました！'
     except Exception as e:
-        return f'エラー: {e}', 500
+        return 'エラー: ' + str(e), 500
 
 
 @app.route('/')
 def index():
-    return '''<h2>LINE Calendar Bot</h2>
-<p>Status: 稼働中</p>
-<p><a href="/auth/google">Googleカレンダーと連携する</a></p>
-<p><a href="/test/morning">朝の通知テスト</a></p>'''
+    return '<h2>LINE Calendar Bot</h2><p>Status: 稼働中</p>'
 
 
 def _startup():
