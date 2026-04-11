@@ -1,153 +1,115 @@
-# scheduler.py
-"""APScheduler セットアップ（毎朝6時の通知 + Chatwork ポーリング）"""
+"""スケジューラー - 毎朝6時にGoogleカレンダーの予定をLINEに送信"""
 import os
 import logging
-from typing import Optional
-
-import pytz
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.triggers.cron import CronTrigger
+import pytz
 
 logger = logging.getLogger(__name__)
 
 JST = pytz.timezone('Asia/Tokyo')
-_scheduler: Optional[BackgroundScheduler] = None
+scheduler = BackgroundScheduler(timezone=JST)
 
 
-# ── ジョブ定義 ────────────────────────────────────────────────
+def send_morning_summary():
+    """毎朝6時に今日の予定をLINEに送信"""
+    logger.info('朝の通知を送信します...')
 
-def _morning_notification_job():
-    """【機能1】毎朝6時にGoogleカレンダーの予定とToDoをLINEに送信する"""
-    logger.info("朝の通知ジョブ開始")
-    try:
-        import state
-        from google_calendar import get_today_events, get_today_tasks
-        from linebot.models import TextSendMessage
-
-        user_id = state.get_primary_user_id()
-        if not user_id:
-            logger.warning("朝の通知: LINE ユーザーID が未設定です（LINEでメッセージを送ると自動登録されます）")
-            return
-        if not state.line_bot_api:
-            logger.warning("朝の通知: LINE Bot API が未初期化です")
-            return
-
-        events = get_today_events()
-        tasks = get_today_tasks()
-        message = _build_morning_message(events, tasks)
-
-        state.line_bot_api.push_message(user_id, TextSendMessage(text=message))
-        logger.info("朝の通知を送信しました")
-
-    except Exception as e:
-        logger.error(f"朝の通知エラー: {e}")
-
-
-def _chatwork_poll_job():
-    """Chatwork の新着メッセージをポーリングする"""
-    try:
-        from chatwork_monitor import poll_chatwork
-        poll_chatwork()
-    except Exception as e:
-        logger.error(f"Chatwork ポーリングエラー: {e}")
-
-
-# ── メッセージ生成 ────────────────────────────────────────────
-
-def _build_morning_message(events, tasks) -> str:
-    """朝の通知メッセージを組み立てる"""
-    from datetime import datetime as dt_
-
-    today = dt_.now(JST)
-    weekday_ja = ['月', '火', '水', '木', '金', '土', '日'][today.weekday()]
-    date_str = today.strftime(f'%Y年%m月%d日({weekday_ja})')
-
-    lines = [
-        f'☀️ おはようございます！',
-        f'📅 {date_str}の予定をお知らせします。',
-        '',
-    ]
-
-    # ── カレンダーイベント ──
-    lines.append('【📆 今日のカレンダー】')
-    if events is None:
-        lines.append('  ⚠️ Googleカレンダーに接続できませんでした')
-        lines.append('  → アプリの /auth/google で認証してください')
-    elif events:
-        for ev in events:
-            summary = ev.get('summary', '（タイトルなし）')
-            start = ev.get('start', {})
-            dt_str = start.get('dateTime', start.get('date', ''))
-            if 'T' in dt_str:
-                try:
-                    t = dt_.fromisoformat(dt_str)
-                    time_label = t.strftime('%H:%M')
-                except Exception:
-                    time_label = dt_str
-                lines.append(f'  🕐 {time_label}　{summary}')
-            else:
-                lines.append(f'  📌 {summary}（終日）')
-    else:
-        lines.append('  今日の予定はありません')
-
-    lines.append('')
-
-    # ── ToDo / タスク ──
-    lines.append('【✅ ToDo】')
-    if tasks:
-        for t in tasks[:10]:  # 最大10件
-            title = t.get('title', '（タイトルなし）')
-            due = t.get('due', '')
-            due_str = f'  (期限: {due[:10]})' if due else ''
-            lines.append(f'  □ {title}{due_str}')
-        if len(tasks) > 10:
-            lines.append(f'  … 他 {len(tasks) - 10} 件')
-    else:
-        lines.append('  タスクはありません')
-
-    lines.append('')
-    lines.append('今日も良い一日を！ 🌟')
-
-    return '\n'.join(lines)
-
-
-# ── スケジューラー起動 ────────────────────────────────────────
-
-def start_scheduler():
-    """APScheduler を起動する（二重起動防止済み）"""
-    global _scheduler
-
-    if _scheduler and _scheduler.running:
-        logger.info("スケジューラーはすでに起動中です")
+    line_user_id = os.environ.get('LINE_USER_ID', '')
+    if not line_user_id:
+        logger.warning('LINE_USER_IDが設定されていません')
         return
 
-    poll_minutes = int(os.environ.get('CHATWORK_POLL_INTERVAL', '5'))
+    try:
+        from google_calendar import get_todays_events
+        events = get_todays_events()
 
-    _scheduler = BackgroundScheduler(timezone=JST)
+        if events:
+            message = '🌅 おはようございます！今日の予定です：\n\n'
+            for event in events:
+                start = event.get('start', {})
+                time_str = start.get('dateTime', start.get('date', ''))
+                if 'T' in time_str:
+                    time_str = time_str[11:16]
+                summary = event.get('summary', '（タイトルなし）')
+                message += f'📅 {time_str} {summary}\n'
+        else:
+            message = '🌅 おはようございます！今日は予定がありません。\n良い一日をお過ごしください！'
 
-    # ── 毎朝6時に予定を通知 ──
-    _scheduler.add_job(
-        _morning_notification_job,
+        from main import send_line_message
+        send_line_message(line_user_id, message)
+        logger.info('朝の通知を送信しました')
+
+    except Exception as e:
+        logger.error(f'朝の通知エラー: {e}')
+        try:
+            from main import send_line_message
+            send_line_message(line_user_id, f'朝の通知でエラーが発生しました: {str(e)}')
+        except Exception:
+            pass
+
+
+def check_chatwork():
+    """Chatworkのメッセージをチェックしてタスク・締切を検出"""
+    logger.info('Chatworkをチェックします...')
+
+    chatwork_token = os.environ.get('CHATWORK_API_TOKEN', '')
+    chatwork_room_ids = os.environ.get('CHATWORK_ROOM_IDS', '')
+    line_user_id = os.environ.get('LINE_USER_ID', '')
+
+    if not chatwork_token or not chatwork_room_ids or not line_user_id:
+        logger.debug('Chatwork設定が不完全です')
+        return
+
+    try:
+        import requests as req
+        room_ids = [r.strip() for r in chatwork_room_ids.split(',') if r.strip()]
+
+        for room_id in room_ids:
+            url = f'https://api.chatwork.com/v2/rooms/{room_id}/messages'
+            headers = {'X-ChatWorkToken': chatwork_token}
+            resp = req.get(url, headers=headers, timeout=10 )
+
+            if resp.status_code == 200:
+                messages = resp.json()
+                if messages:
+                    combined = '\n'.join([m.get('body', '') for m in messages[-5:]])
+
+                    from main import analyze_message_with_ai, send_line_message
+                    analysis = analyze_message_with_ai(combined)
+
+                    if '予定' in analysis or '締切' in analysis or 'タスク' in analysis or 'deadline' in analysis.lower():
+                        message = f'💬 Chatwork({room_id})から通知:\n{analysis}'
+                        send_line_message(line_user_id, message)
+
+    except Exception as e:
+        logger.error(f'Chatworkチェックエラー: {e}')
+
+
+def start_scheduler():
+    """スケジューラーを開始"""
+    if scheduler.running:
+        logger.info('スケジューラーはすでに起動中です')
+        return
+
+    scheduler.add_job(
+        send_morning_summary,
         CronTrigger(hour=6, minute=0, timezone=JST),
-        id='morning_notification',
-        name='朝6時の予定通知',
-        misfire_grace_time=600,  # 10分以内に実行できれば遅延実行を許可
-        replace_existing=True,
+        id='morning_summary',
+        replace_existing=True
     )
+    logger.info('朝6時の予定通知ジョブを登録しました')
 
-    # ── Chatwork ポーリング（デフォルト5分ごと） ──
-    _scheduler.add_job(
-        _chatwork_poll_job,
-        'interval',
-        minutes=poll_minutes,
-        id='chatwork_poll',
-        name='Chatwork ポーリング',
-        misfire_grace_time=60,
-        replace_existing=True,
-    )
+    chatwork_token = os.environ.get('CHATWORK_API_TOKEN', '')
+    if chatwork_token:
+        scheduler.add_job(
+            check_chatwork,
+            'interval',
+            minutes=5,
+            id='chatwork_check',
+            replace_existing=True
+        )
+        logger.info('Chatworkポーリングジョブを登録しました（5分ごと）')
 
-    _scheduler.start()
-    logger.info(
-        f"スケジューラー起動完了 "
-        f"（朝の通知: 毎朝6:00 JST, Chatwork ポーリング: {poll_minutes}分ごと）"
-    )
+    scheduler.start()
+    logger.info('スケジューラーを起動しました')

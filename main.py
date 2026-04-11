@@ -1,17 +1,12 @@
-# main.py
-"""LINE Calendar Bot – Flask アプリケーション エントリーポイント"""
+"""LINE Calendar Bot - Flask + LINE Messaging API (requests only)"""
 import os
 import json
-import uuid
+import hmac
+import hashlib
+import base64
 import logging
-
+import requests
 from flask import Flask, request, abort
-from linebot import LineBotApi, WebhookHandler
-from linebot.exceptions import InvalidSignatureError
-from linebot.models import (
-    MessageEvent, TextMessage, PostbackEvent,
-    TextSendMessage, TemplateSendMessage, ConfirmTemplate, PostbackAction,
-)
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -22,208 +17,169 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── 共有状態の初期化 ──────────────────────────────────────────
-import state
-
-state.init_line_bot_api()
-state.load_user_ids()
-
-# ── Flask アプリ ──────────────────────────────────────────────
 app = Flask(__name__)
 
 LINE_CHANNEL_SECRET = os.environ.get('LINE_CHANNEL_SECRET', '')
-handler = WebhookHandler(LINE_CHANNEL_SECRET)
+LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '')
+LINE_USER_ID = os.environ.get('LINE_USER_ID', '')
 
 
-# ── ヘルパー関数 ──────────────────────────────────────────────
-
-def _fmt_event_preview(event_data: dict) -> str:
-    """カレンダー追加確認メッセージ用のプレビューテキストを生成する"""
-    summary = event_data.get('summary', '予定')
-    start = event_data.get('start_datetime', '')
-    desc = event_data.get('description', '')
-
-    lines = [f"📌 {summary}"]
-    if start:
-        lines.append(f"🕐 {start}")
-    if desc:
-        lines.append(f"📝 {desc[:50]}")
-    return '\n'.join(lines)
+def verify_signature(body: bytes, signature: str) -> bool:
+    """LINE Webhook署名検証"""
+    hash_val = hmac.new(
+        LINE_CHANNEL_SECRET.encode('utf-8'),
+        body,
+        hashlib.sha256
+    ).digest()
+    expected = base64.b64encode(hash_val).decode('utf-8')
+    return hmac.compare_digest(expected, signature)
 
 
-def build_confirm_message(event_id: str, event_data: dict, prefix: str = '') -> TemplateSendMessage:
-    """Googleカレンダー追加確認用の ConfirmTemplate を返す"""
-    preview = _fmt_event_preview(event_data)
-    body = (prefix + preview)[:240]  # ConfirmTemplate のテキスト上限
+def send_line_message(user_id: str, text: str):
+    """LINEにメッセージを送信する"""
+    url = 'https://api.line.me/v2/bot/message/push'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
+    }
+    payload = {
+        'to': user_id,
+        'messages': [{'type': 'text', 'text': text}]
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10 )
+        logger.info(f'LINE push response: {resp.status_code}')
+        return resp.status_code == 200
+    except Exception as e:
+        logger.error(f'LINE push error: {e}')
+        return False
 
-    return TemplateSendMessage(
-        alt_text='Googleカレンダーに追加しますか？',
-        template=ConfirmTemplate(
-            text=body,
-            actions=[
-                PostbackAction(
-                    label='追加する ✅',
-                    data=json.dumps({'action': 'add', 'event_id': event_id}),
-                ),
-                PostbackAction(
-                    label='追加しない ❌',
-                    data=json.dumps({'action': 'skip', 'event_id': event_id}),
-                ),
+
+def reply_line_message(reply_token: str, text: str):
+    """LINEにリプライメッセージを送信する"""
+    url = 'https://api.line.me/v2/bot/message/reply'
+    headers = {
+        'Content-Type': 'application/json',
+        'Authorization': f'Bearer {LINE_CHANNEL_ACCESS_TOKEN}'
+    }
+    payload = {
+        'replyToken': reply_token,
+        'messages': [{'type': 'text', 'text': text}]
+    }
+    try:
+        resp = requests.post(url, headers=headers, json=payload, timeout=10 )
+        logger.info(f'LINE reply response: {resp.status_code}')
+    except Exception as e:
+        logger.error(f'LINE reply error: {e}')
+
+
+def analyze_message_with_ai(text: str) -> str:
+    """AIでメッセージを分析して予定・締切を検出する"""
+    try:
+        from openai import OpenAI
+        api_key = os.environ.get('OPENAI_API_KEY', '')
+
+        client = OpenAI(
+            api_key=api_key,
+            base_url='https://generativelanguage.googleapis.com/v1beta/openai/'
+         )
+
+        response = client.chat.completions.create(
+            model='gemini-2.0-flash',
+            messages=[
+                {
+                    'role': 'system',
+                    'content': 'あなたはフリーランスのアシスタントです。メッセージから予定、締切、タスクを検出して日本語で簡潔に報告してください。予定や締切がない場合は「特に予定・締切はありません」と答えてください。'
+                },
+                {
+                    'role': 'user',
+                    'content': f'以下のメッセージから予定・締切・タスクを検出してください:\n\n{text}'
+                }
             ],
-        ),
-    )
+            max_tokens=500
+        )
+        return response.choices[0].message.content
+    except Exception as e:
+        logger.error(f'AI analysis error: {e}')
+        return f'AI分析エラー: {str(e)}'
 
-
-# ── LINE Webhook ──────────────────────────────────────────────
 
 @app.route('/webhook', methods=['POST'])
 def webhook():
+    """LINE Webhookエンドポイント"""
     signature = request.headers.get('X-Line-Signature', '')
-    body = request.get_data(as_text=True)
-    try:
-        handler.handle(body, signature)
-    except InvalidSignatureError:
-        logger.warning("LINEシグネチャが不正です")
+    body = request.get_data()
+
+    if not verify_signature(body, signature):
+        logger.warning('Invalid signature')
         abort(400)
-    return 'OK'
 
-
-@handler.add(MessageEvent, message=TextMessage)
-def on_text_message(event):
-    """【機能3】LINEメッセージから予定を検出してカレンダー追加を提案する"""
-    user_id = event.source.user_id
-    text = event.message.text.strip()
-
-    # ユーザーIDを保存（プッシュ通知用）
-    state.save_user_id(user_id)
-
-    from ai_analyzer import analyze_message
     try:
-        result = analyze_message(text)
+        events = json.loads(body.decode('utf-8')).get('events', [])
     except Exception as e:
-        logger.error(f"AI分析エラー: {e}")
-        return
+        logger.error(f'JSON parse error: {e}')
+        abort(400)
 
-    if not (result and result.get('has_schedule')):
-        return  # 予定が検出されなければ何もしない
+    for event in events:
+        if event.get('type') == 'message' and event.get('message', {}).get('type') == 'text':
+            reply_token = event.get('replyToken', '')
+            user_id = event.get('source', {}).get('userId', '')
+            text = event['message']['text']
 
-    eid = str(uuid.uuid4())
-    state.pending_events[eid] = {
-        'user_id': user_id,
-        'source': 'line',
-        'event_data': result['event_data'],
-        'original_text': text,
-    }
+            logger.info(f'Received message from {user_id}: {text}')
 
-    msg = build_confirm_message(
-        eid,
-        result['event_data'],
-        prefix='📅 予定を検出しました！\n\n',
-    )
-    state.line_bot_api.reply_message(event.reply_token, msg)
+            if user_id and not LINE_USER_ID:
+                logger.info(f'LINE User ID detected: {user_id}')
 
+            analysis = analyze_message_with_ai(text)
+            reply_text = f'📋 メッセージ分析結果:\n{analysis}'
 
-@handler.add(PostbackEvent)
-def on_postback(event):
-    """「追加する」「追加しない」ボタンのポストバックを処理する"""
-    try:
-        data = json.loads(event.postback.data)
-    except (json.JSONDecodeError, KeyError):
-        return
+            reply_line_message(reply_token, reply_text)
 
-    action = data.get('action')
-    eid = data.get('event_id', '')
+    return 'OK', 200
 
-    if action == 'add':
-        pending = state.pending_events.pop(eid, None)
-        if not pending:
-            state.line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(text='⚠️ 予定情報が見つかりませんでした（タイムアウトの可能性）。'),
-            )
-            return
-
-        from google_calendar import add_event
-        result = add_event(pending['event_data'])
-
-        if result:
-            summary = result.get('summary', '予定')
-            start_info = result.get('start', {})
-            start_str = start_info.get('dateTime', start_info.get('date', ''))
-            state.line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text=f'✅ Googleカレンダーに追加しました！\n\n📌 {summary}\n🕐 {start_str}'
-                ),
-            )
-        else:
-            state.line_bot_api.reply_message(
-                event.reply_token,
-                TextSendMessage(
-                    text='❌ カレンダーへの追加に失敗しました。\n'
-                         '認証が必要な場合は /auth/google にアクセスしてください。'
-                ),
-            )
-
-    elif action == 'skip':
-        state.pending_events.pop(eid, None)
-        state.line_bot_api.reply_message(
-            event.reply_token,
-            TextSendMessage(text='わかりました。カレンダーには追加しませんでした。'),
-        )
-
-
-# ── Google OAuth2 エンドポイント ──────────────────────────────
 
 @app.route('/auth/google')
 def auth_google():
-    """Google OAuth2 フローを開始する"""
-    from google_calendar import get_auth_url
+    """Google OAuth2認証開始"""
     try:
-        url = get_auth_url(request.host_url)
-        return (
-            '<h2>Google Calendar 認証</h2>'
-            f'<p><a href="{url}" style="font-size:1.2em;">🔗 こちらをクリックしてGoogleアカウントで認証</a></p>'
-            '<p>認証後、このページに自動的にリダイレクトされます。</p>'
-        )
+        from google_calendar import get_auth_url
+        auth_url = get_auth_url()
+        return f'<a href="{auth_url}">Googleカレンダーと連携する</a>'
     except Exception as e:
-        return f'<p>エラー: {e}</p>', 500
+        return f'エラー: {e}', 500
 
 
 @app.route('/auth/google/callback')
 def auth_google_callback():
-    """Google OAuth2 コールバックを処理してトークンを保存する"""
-    code = request.args.get('code')
-    if not code:
-        return '認証がキャンセルされました。', 400
-
-    from google_calendar import handle_auth_callback
-    ok = handle_auth_callback(code, request.host_url)
-    if ok:
-        return (
-            '<h2>✅ 認証完了！</h2>'
-            '<p>Googleカレンダーへのアクセスが有効になりました。</p>'
-            '<p>このブラウザタブを閉じてください。</p>'
-        )
-    return '❌ 認証処理に失敗しました。サーバーログを確認してください。', 500
+    """Google OAuth2コールバック"""
+    try:
+        from google_calendar import handle_callback
+        code = request.args.get('code', '')
+        handle_callback(code)
+        return 'Googleカレンダーの連携が完了しました！LINEに通知します。'
+    except Exception as e:
+        return f'エラー: {e}', 500
 
 
-# ── ヘルスチェック ─────────────────────────────────────────────
+@app.route('/test/morning')
+def test_morning():
+    """朝の通知テスト"""
+    try:
+        from scheduler import send_morning_summary
+        send_morning_summary()
+        return '朝の通知を送信しました！'
+    except Exception as e:
+        return f'エラー: {e}', 500
 
-@app.route('/', methods=['GET'])
+
+@app.route('/')
 def index():
-    user_count = len(state.user_ids)
-    auth_status = '✅ 認証済み' if os.path.exists('token.json') else '❌ 未認証 → /auth/google'
-    return (
-        f'<h2>LINE Calendar Bot 🤖</h2>'
-        f'<p>Status: 稼働中</p>'
-        f'<p>Google Calendar: {auth_status}</p>'
-        f'<p>登録ユーザー数: {user_count}</p>'
-        f'<p><a href="/auth/google">Google認証はこちら</a></p>'
-    )
+    return '''<h2>LINE Calendar Bot</h2>
+<p>Status: 稼働中</p>
+<p><a href="/auth/google">Googleカレンダーと連携する</a></p>
+<p><a href="/test/morning">朝の通知テスト</a></p>'''
 
-
-# ── アプリ起動時の初期化 ──────────────────────────────────────
 
 def _startup():
     from scheduler import start_scheduler

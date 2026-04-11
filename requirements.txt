@@ -1,7 +1,4 @@
 ﻿flask==3.0.3
-line-bot-sdk==2.4.3
-aiohttp==3.8.4
-requests==2.31.0
 google-auth==2.29.0
 google-auth-oauthlib==1.2.0
 google-api-python-client==2.127.0
@@ -10,3 +7,4 @@ APScheduler==3.10.4
 python-dotenv==1.0.1
 gunicorn==22.0.0
 pytz==2024.1
+requests==2.31.0
