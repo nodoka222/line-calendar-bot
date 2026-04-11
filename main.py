@@ -24,7 +24,7 @@ LINE_CHANNEL_ACCESS_TOKEN = os.environ.get('LINE_CHANNEL_ACCESS_TOKEN', '').stri
 LINE_USER_ID = os.environ.get('LINE_USER_ID', '').strip()
 
 GEMINI_API_KEY = os.environ.get('OPENAI_API_KEY', '').strip()
-GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent'
+GEMINI_API_URL = 'https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent'
 
 
 def verify_signature(body: bytes, signature: str ) -> bool:
